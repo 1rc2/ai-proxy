@@ -1,20 +1,18 @@
-// Vercel Function：代理 DeepSeek API，隐藏 API key
-// 部署后在 Vercel 后台 Settings → Environment Variables 设置 DEEPSEEK_API_KEY
-//
-// 环境变量：
+// Vercel Serverless Function (Node.js)：代理 DeepSeek API，隐藏 API key
+// 部署后在 Vercel 后台 Settings → Environment Variables 设置：
 //   DEEPSEEK_API_KEY  必填，DeepSeek 的 sk-xxx key
 //   ALLOWED_ORIGIN    可选，允许的前端域名，默认 * （生产建议改为你自己的域名）
 //   DAILY_LIMIT       可选，每个 IP 每天最多调用次数，默认 50，设 0 为不限制
 
-export const runtime = "nodejs";
-
 const DEEPSEEK_URL = "https://api.deepseek.com/v1/chat/completions";
 
-const corsHeaders = (origin) => ({
-  "Access-Control-Allow-Origin": origin || "*",
-  "Access-Control-Allow-Methods": "POST, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type"
-});
+function corsHeaders(origin) {
+  return {
+    "Access-Control-Allow-Origin": origin || "*",
+    "Access-Control-Allow-Methods": "POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type"
+  };
+}
 
 /* 简易每日限流：按 IP + 日期计数，UTC 次日自动重置 */
 const counter = new Map(); // key: "ip:YYYY-MM-DD" -> count
@@ -27,61 +25,64 @@ function todayKey() {
 }
 
 function getClientIp(req) {
-  // Vercel 会把真实 IP 放在 x-forwarded-for
-  const xff = req.headers.get("x-forwarded-for");
-  if (xff) return xff.split(",")[0].trim();
-  return req.headers.get("x-real-ip") || "unknown";
+  const xff = req.headers["x-forwarded-for"];
+  if (xff) return String(xff).split(",")[0].trim();
+  return req.headers["x-real-ip"] || req.socket.remoteAddress || "unknown";
 }
 
-export default async function handler(req) {
+function sendJson(res, status, obj, origin) {
+  res.status(status).setHeader("Content-Type", "application/json");
+  const h = corsHeaders(origin);
+  for (const k of Object.keys(h)) res.setHeader(k, h[k]);
+  res.end(JSON.stringify(obj));
+}
+
+export default async function handler(req, res) {
   const allow = process.env.ALLOWED_ORIGIN || "*";
+  const origin = req.headers.origin;
 
   // CORS 预检
   if (req.method === "OPTIONS") {
-    return new Response(null, { status: 204, headers: corsHeaders(allow) });
+    const h = corsHeaders(allow);
+    for (const k of Object.keys(h)) res.setHeader(k, h[k]);
+    res.status(204).end();
+    return;
   }
   if (req.method !== "POST") {
-    return new Response(
-      JSON.stringify({ error: "仅支持 POST" }),
-      { status: 405, headers: { "Content-Type": "application/json", ...corsHeaders(allow) } }
-    );
+    sendJson(res, 405, { error: "仅支持 POST" }, origin);
+    return;
   }
 
   const apiKey = process.env.DEEPSEEK_API_KEY;
   if (!apiKey) {
-    return new Response(
-      JSON.stringify({ error: "服务器未配置 DEEPSEEK_API_KEY 环境变量" }),
-      { status: 500, headers: { "Content-Type": "application/json", ...corsHeaders(allow) } }
-    );
+    sendJson(res, 500, { error: "服务器未配置 DEEPSEEK_API_KEY 环境变量" }, origin);
+    return;
   }
 
   // 每日访问限制
   const dailyLimit = parseInt(process.env.DAILY_LIMIT, 10);
-  if (isNaN(dailyLimit) || dailyLimit <= 0) {
-    // 不限制
-  } else {
+  if (!isNaN(dailyLimit) && dailyLimit > 0) {
     const ip = getClientIp(req);
     const key = ip + ":" + todayKey();
     const used = counter.get(key) || 0;
     if (used >= dailyLimit) {
-      return new Response(
-        JSON.stringify({ error: "今日AI使用次数已达上限（" + dailyLimit + "次），请明天再试。" }),
-        { status: 429, headers: { "Content-Type": "application/json", ...corsHeaders(allow) } }
-      );
+      sendJson(res, 429, { error: "今日AI使用次数已达上限（" + dailyLimit + "次），请明天再试。" }, origin);
+      return;
     }
     counter.set(key, used + 1);
   }
 
+  // 读取请求体
   let body;
-  try { body = await req.json(); }
-  catch (e) {
-    return new Response(
-      JSON.stringify({ error: "请求体不是合法 JSON" }),
-      { status: 400, headers: { "Content-Type": "application/json", ...corsHeaders(allow) } }
-    );
+  try {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    body = JSON.parse(Buffer.concat(chunks).toString() || "{}");
+  } catch (e) {
+    sendJson(res, 400, { error: "请求体不是合法 JSON" }, origin);
+    return;
   }
 
-  // 仅透传 messages，model/max_tokens 在这里强制，前端无法越权
   const messages = Array.isArray(body.messages) ? body.messages : [];
 
   try {
@@ -100,14 +101,11 @@ export default async function handler(req) {
     });
 
     const text = await upstream.text();
-    return new Response(text, {
-      status: upstream.status,
-      headers: { "Content-Type": "application/json", ...corsHeaders(allow) }
-    });
+    res.status(upstream.status).setHeader("Content-Type", "application/json");
+    const h = corsHeaders(allow);
+    for (const k of Object.keys(h)) res.setHeader(k, h[k]);
+    res.end(text);
   } catch (e) {
-    return new Response(
-      JSON.stringify({ error: "上游请求失败: " + (e.message || String(e)) }),
-      { status: 502, headers: { "Content-Type": "application/json", ...corsHeaders(allow) } }
-    );
+    sendJson(res, 502, { error: "上游请求失败: " + (e.message || String(e)) }, origin);
   }
 }
