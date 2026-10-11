@@ -5,7 +5,7 @@
 //   DEEPSEEK_API_KEY  必填，DeepSeek 的 sk-xxx key
 //   ALLOWED_ORIGIN    可选，允许的前端域名，默认 * （生产建议改为你自己的域名）
 
-export const config = { runtime: "edge" };
+export const runtime = "nodejs";
 
 const DEEPSEEK_URL = "https://api.deepseek.com/v1/chat/completions";
 
